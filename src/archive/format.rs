@@ -13,6 +13,10 @@ pub mod flags {
     pub const HAS_MANIFEST: u32 = 1 << 1;
     pub const HAS_CERTIFICATES: u32 = 1 << 2;
     pub const VERIFIED: u32 = 1 << 3;
+    /// Single-stream mode: entire file compressed as one zstd stream, no chunking.
+    /// The archive is just: header (88 bytes) + compressed data.
+    /// TOC/file map offsets are unused (set to 0). chunk_count = 0.
+    pub const SINGLE_STREAM: u32 = 1 << 4;
 }
 
 /// Archive file header (88 bytes on disk).
@@ -36,6 +40,10 @@ impl ArchiveHeader {
 
     pub fn has_manifest(&self) -> bool {
         self.flags & flags::HAS_MANIFEST != 0
+    }
+
+    pub fn is_single_stream(&self) -> bool {
+        self.flags & flags::SINGLE_STREAM != 0
     }
 }
 

@@ -33,9 +33,9 @@ pub struct CompressArgs {
     #[arg(long, default_value = "2")]
     pub stratum_threshold: u8,
 
-    /// Skip JSON-LD manifest generation
+    /// Include JSON-LD manifest in archive
     #[arg(long)]
-    pub no_manifest: bool,
+    pub manifest: bool,
 
     /// Include derivation certificates
     #[arg(long)]
@@ -123,7 +123,7 @@ pub fn compress(args: CompressArgs) -> Result<()> {
         mode,
         level,
         chunk_params: ChunkParams::default(),
-        emit_manifest: !args.no_manifest,
+        emit_manifest: args.manifest,
         emit_certificates: args.certificates,
         verify_on_compress: args.verify,
     };

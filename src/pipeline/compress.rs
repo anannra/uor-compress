@@ -1,12 +1,14 @@
 use std::fs;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::Path;
+
+use byteorder::{LittleEndian, WriteBytesExt};
 
 use crate::algebra::address::ChunkId;
 use crate::analysis::classifier::ChunkClass;
 use crate::analysis::delta::DeltaDetector;
 use crate::analysis::stratum_profile::ChunkProfile;
-use crate::archive::format::{flags, FileMapEntry, TocEntry};
+use crate::archive::format::{flags, ArchiveHeader, FileMapEntry, TocEntry, MAGIC, VERSION};
 use crate::archive::manifest;
 use crate::archive::writer::ArchiveWriter;
 use crate::backend::delta_backend::DeltaCompressor;
@@ -45,34 +47,122 @@ impl CompressStats {
 /// Compress a file using the UOR pipeline.
 pub fn compress_file(input: &Path, output: &Path, config: &CompressConfig) -> Result<CompressStats> {
     let input_data = fs::read(input)?;
-    let original_size = input_data.len() as u64;
-
     if input_data.is_empty() {
-        // Handle empty file: write minimal archive.
-        let checksum = integrity::file_checksum(&input_data);
-        let file = fs::File::create(output)?;
-        let writer = BufWriter::new(file);
-        let archive_flags = if config.emit_manifest { flags::HAS_MANIFEST } else { 0 };
-        let archive = ArchiveWriter::new(writer, 0, checksum, archive_flags)?;
-        archive.finalize(None)?;
-        let compressed_size = fs::metadata(output)?.len();
-        return Ok(CompressStats {
-            original_size: 0,
-            compressed_size,
-            chunk_count: 0,
-            unique_chunks: 0,
-            duplicate_chunks: 0,
-            delta_chunks: 0,
-        });
+        return compress_empty(output, config);
     }
 
     let checksum = integrity::file_checksum(&input_data);
 
-    // Step 1: Content-defined chunking.
+    // Content-defined chunking.
     let chunker = Chunker::new(config.chunk_params.clone());
     let chunks = chunker.chunk(&input_data);
 
-    // Step 2-7: Process chunks.
+    // Check for deduplication opportunity: do any chunks repeat?
+    let mut seen = std::collections::HashSet::new();
+    let has_duplicates = chunks.iter().any(|c| !seen.insert(c.id));
+
+    // Single-stream fast path: when there are no duplicate chunks, compress the
+    // entire file as one zstd stream. This eliminates per-chunk overhead and gives
+    // the compressor the full file as dictionary context — matching gzip behavior.
+    if !has_duplicates && matches!(config.mode, CompressionMode::Lossless) {
+        return compress_single_stream(&input_data, output, checksum, config);
+    }
+
+    // Multi-chunk path with dedup/delta support.
+    compress_chunked(&input_data, &chunks, output, checksum, config)
+}
+
+/// Write a minimal archive for an empty file.
+fn compress_empty(output: &Path, config: &CompressConfig) -> Result<CompressStats> {
+    let checksum = integrity::file_checksum(&[]);
+    let file = fs::File::create(output)?;
+    let writer = BufWriter::new(file);
+    let archive_flags = if config.emit_manifest { flags::HAS_MANIFEST } else { 0 };
+    let archive = ArchiveWriter::new(writer, 0, checksum, archive_flags)?;
+    archive.finalize(None)?;
+    let compressed_size = fs::metadata(output)?.len();
+    Ok(CompressStats {
+        original_size: 0,
+        compressed_size,
+        chunk_count: 0,
+        unique_chunks: 0,
+        duplicate_chunks: 0,
+        delta_chunks: 0,
+    })
+}
+
+/// Single-stream compression: header (88 bytes) + one zstd frame.
+/// No TOC, no file map, no chunking overhead. Maximizes compression ratio.
+fn compress_single_stream(
+    data: &[u8],
+    output: &Path,
+    checksum: [u8; 32],
+    config: &CompressConfig,
+) -> Result<CompressStats> {
+    let original_size = data.len() as u64;
+
+    let zstd_level = match config.level {
+        CompressionLevel::Fast => 1,
+        CompressionLevel::Default => 3,
+        CompressionLevel::Best => 19,
+    };
+
+    let compressed_data = zstd::encode_all(data, zstd_level)
+        .map_err(crate::error::Error::Io)?;
+
+    // If compression expanded the data, store raw.
+    let (final_data, backend_tag) = if compressed_data.len() >= data.len() {
+        (data.to_vec(), BackendTag::Identity)
+    } else {
+        (compressed_data, BackendTag::Zstd)
+    };
+
+    let archive_flags: u32 = flags::SINGLE_STREAM;
+    // Encode backend in file_map_count field (repurposed in single-stream mode).
+    let backend_byte = backend_tag as u32;
+
+    let file = fs::File::create(output)?;
+    let mut w = BufWriter::new(file);
+
+    // Write header.
+    w.write_all(&MAGIC)?;
+    w.write_u16::<LittleEndian>(VERSION)?;
+    w.write_u32::<LittleEndian>(archive_flags)?;
+    w.write_u64::<LittleEndian>(original_size)?;
+    w.write_u32::<LittleEndian>(1)?; // chunk_count = 1 (logical)
+    w.write_u32::<LittleEndian>(backend_byte)?; // file_map_count repurposed as backend tag
+    w.write_u64::<LittleEndian>(0)?; // toc_offset unused
+    w.write_u64::<LittleEndian>(0)?; // file_map_offset unused
+    w.write_u64::<LittleEndian>(0)?; // manifest_offset unused
+    w.write_all(&checksum)?;
+    w.write_all(&[0u8; 2])?; // reserved
+    // Write compressed data immediately after header.
+    w.write_all(&final_data)?;
+    w.flush()?;
+    drop(w);
+
+    let compressed_size = fs::metadata(output)?.len();
+
+    Ok(CompressStats {
+        original_size,
+        compressed_size,
+        chunk_count: 1,
+        unique_chunks: 1,
+        duplicate_chunks: 0,
+        delta_chunks: 0,
+    })
+}
+
+/// Multi-chunk compression with dedup and delta support.
+fn compress_chunked(
+    input_data: &[u8],
+    chunks: &[crate::chunk::cdc::Chunk],
+    output: &Path,
+    checksum: [u8; 32],
+    config: &CompressConfig,
+) -> Result<CompressStats> {
+    let original_size = input_data.len() as u64;
+
     let mut store = ChunkStore::new();
     let mut delta_detector = DeltaDetector::new();
     let mut compressed_chunks: Vec<(ChunkId, CompressedChunk)> = Vec::new();
@@ -93,25 +183,21 @@ pub fn compress_file(input: &Path, output: &Path, config: &CompressConfig) -> Re
         archive_flags |= flags::HAS_CERTIFICATES;
     }
 
-    for chunk in &chunks {
-        // File map entry for reconstruction.
+    for chunk in chunks {
         file_map_entries.push(FileMapEntry {
             file_offset: chunk.offset,
             chunk_id: chunk.id,
             length: chunk.data.len() as u32,
         });
 
-        // Deduplication check.
         let (_, is_new) = store.insert(chunk.id, chunk.data.clone());
         if !is_new {
             duplicate_count += 1;
-            continue; // Already stored.
+            continue;
         }
 
-        // Triadic analysis.
         let profile = ChunkProfile::analyze(chunk.id, &chunk.data);
 
-        // Delta detection (for Default/Best levels).
         let classification = match config.level {
             CompressionLevel::Fast => profile.classification.clone(),
             _ => {
@@ -123,10 +209,8 @@ pub fn compress_file(input: &Path, output: &Path, config: &CompressConfig) -> Re
             }
         };
 
-        // Register chunk for future delta detection.
         delta_detector.register(chunk.id, &chunk.data);
 
-        // Route to backend.
         let compressed = match &classification {
             ChunkClass::NearDuplicate { base, fidelity: _ } => {
                 let base_data = store.get(base).map(|s| s.data.clone());
@@ -152,7 +236,6 @@ pub fn compress_file(input: &Path, output: &Path, config: &CompressConfig) -> Re
                 }
             }
             _ => {
-                // Lossy quantization path.
                 if let CompressionMode::Lossy {
                     stratum_threshold,
                     min_fidelity: _,
@@ -178,13 +261,15 @@ pub fn compress_file(input: &Path, output: &Path, config: &CompressConfig) -> Re
             }
         };
 
-        // Generate derivation certificate if requested.
         if config.emit_certificates {
             let class_str = format!("{:?}", classification);
             let fidelity = if is_lossy { 0.95 } else { 1.0 };
             derivations.push(CompressionDerivation::new(
                 &chunk.id.to_urn(),
-                &format!("urn:uor:compressed:sha256:{}", ChunkId::from_data(&compressed.compressed_data).to_hex()),
+                &format!(
+                    "urn:uor:compressed:sha256:{}",
+                    ChunkId::from_data(&compressed.compressed_data).to_hex()
+                ),
                 &format!("{:?}", compressed.backend),
                 compressed.original_size as u64,
                 compressed.compressed_size as u64,
@@ -197,7 +282,7 @@ pub fn compress_file(input: &Path, output: &Path, config: &CompressConfig) -> Re
         compressed_chunks.push((chunk.id, compressed));
     }
 
-    // Step 8-9: Write archive.
+    // Write archive.
     let file = fs::File::create(output)?;
     let writer = BufWriter::new(file);
     let mut archive = ArchiveWriter::new(writer, original_size, checksum, archive_flags)?;
@@ -210,7 +295,7 @@ pub fn compress_file(input: &Path, output: &Path, config: &CompressConfig) -> Re
             compressed_size: cc.compressed_size,
             original_size: cc.original_size,
             base_chunk_id: cc.base_chunk_id,
-            stratum_summary: [0u8; 9], // TODO: fill from profile
+            stratum_summary: [0u8; 9],
         };
         archive.write_chunk_data(toc, &cc.compressed_data)?;
     }
@@ -219,11 +304,10 @@ pub fn compress_file(input: &Path, output: &Path, config: &CompressConfig) -> Re
         archive.add_file_map_entry(entry.clone());
     }
 
-    // Generate and write manifest.
     let manifest_bytes = if config.emit_manifest {
-        let archive_hash = &ChunkId::from_data(&input_data).to_hex()[..16];
+        let archive_hash = &ChunkId::from_data(input_data).to_hex()[..16];
         let manifest_value = manifest::generate_manifest(
-            &crate::archive::format::ArchiveHeader {
+            &ArchiveHeader {
                 version: 1,
                 flags: archive_flags,
                 original_size,
@@ -295,7 +379,6 @@ fn compress_with_standard_backend(
         }
     };
 
-    // Fall back to identity if compression expanded the data.
     let (final_data, final_tag) = if compressed_data.len() >= data.len() {
         (data.to_vec(), BackendTag::Identity)
     } else {

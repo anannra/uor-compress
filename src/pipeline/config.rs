@@ -40,7 +40,7 @@ impl Default for CompressConfig {
             mode: CompressionMode::Lossless,
             level: CompressionLevel::Default,
             chunk_params: ChunkParams::default(),
-            emit_manifest: true,
+            emit_manifest: false,
             emit_certificates: false,
             verify_on_compress: false,
         }
