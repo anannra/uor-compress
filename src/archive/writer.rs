@@ -43,6 +43,16 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         })
     }
 
+    /// Write a shared dictionary right after the header, before chunk data.
+    pub fn write_dictionary(&mut self, dict: &[u8]) -> Result<()> {
+        self.writer
+            .write_u32::<LittleEndian>(dict.len() as u32)?;
+        self.writer.write_all(dict)?;
+        self.data_offset += 4 + dict.len() as u64;
+        self.header.flags |= crate::archive::format::flags::HAS_DICTIONARY;
+        Ok(())
+    }
+
     /// Write a compressed chunk's data. Returns the offset where it was written.
     pub fn write_chunk_data(
         &mut self,

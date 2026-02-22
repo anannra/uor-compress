@@ -27,6 +27,29 @@ impl ZstdBackend {
     }
 }
 
+impl ZstdBackend {
+    /// Compress using a shared dictionary for cross-chunk context.
+    pub fn compress_with_dict(&self, data: &[u8], dict: &[u8]) -> Result<Vec<u8>> {
+        let mut compressor =
+            zstd::bulk::Compressor::with_dictionary(self.level, dict).map_err(Error::Io)?;
+        compressor.compress(data).map_err(Error::Io)
+    }
+
+    /// Decompress using a shared dictionary.
+    pub fn decompress_with_dict(
+        &self,
+        compressed: &[u8],
+        original_size: usize,
+        dict: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut decompressor =
+            zstd::bulk::Decompressor::with_dictionary(dict).map_err(Error::Io)?;
+        decompressor
+            .decompress(compressed, original_size)
+            .map_err(Error::Io)
+    }
+}
+
 impl CompressBackend for ZstdBackend {
     fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
         zstd::encode_all(data, self.level).map_err(|e| Error::Io(e))

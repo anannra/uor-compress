@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::algebra::address::ChunkId;
-use crate::archive::format::{ArchiveHeader, FileMapEntry, TocEntry, MAGIC, VERSION};
+use crate::archive::format::{flags, ArchiveHeader, FileMapEntry, TocEntry, MAGIC, VERSION};
 use crate::backend::traits::BackendTag;
 use crate::error::{Error, Result};
 
@@ -16,12 +16,25 @@ pub struct ArchiveReader<R: Read + Seek> {
     pub file_map: Vec<FileMapEntry>,
     /// Index from ChunkId to TOC index for fast lookup.
     toc_index: HashMap<ChunkId, usize>,
+    /// Shared zstd dictionary, if present.
+    pub dictionary: Option<Vec<u8>>,
 }
 
 impl<R: Read + Seek> ArchiveReader<R> {
     /// Open an archive and read all metadata (header, TOC, file map).
     pub fn open(mut reader: R) -> Result<Self> {
         let header = Self::read_header(&mut reader)?;
+
+        // Read dictionary if present (stored right after header at offset 88).
+        let dictionary = if header.flags & flags::HAS_DICTIONARY != 0 {
+            reader.seek(SeekFrom::Start(88))?;
+            let dict_size = reader.read_u32::<LittleEndian>()? as usize;
+            let mut dict = vec![0u8; dict_size];
+            reader.read_exact(&mut dict)?;
+            Some(dict)
+        } else {
+            None
+        };
 
         // Read TOC.
         reader.seek(SeekFrom::Start(header.toc_offset))?;
@@ -46,6 +59,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             toc,
             file_map,
             toc_index,
+            dictionary,
         })
     }
 

@@ -128,6 +128,9 @@ fn decompress_chunked<R: Read + Seek>(
 
     let mut decompressed_chunks: HashMap<ChunkId, Vec<u8>> = HashMap::new();
 
+    // Get shared dictionary if present.
+    let dict = archive.dictionary.clone();
+
     // First pass: decompress non-delta chunks.
     for toc_entry in &archive.toc.clone() {
         if toc_entry.backend == BackendTag::Delta {
@@ -140,8 +143,16 @@ fn decompress_chunked<R: Read + Seek>(
                 IdentityBackend.decompress(&compressed_data, toc_entry.original_size as usize)?
             }
             BackendTag::Zstd => {
-                ZstdBackend::default_level()
-                    .decompress(&compressed_data, toc_entry.original_size as usize)?
+                if let Some(ref d) = dict {
+                    ZstdBackend::default_level().decompress_with_dict(
+                        &compressed_data,
+                        toc_entry.original_size as usize,
+                        d,
+                    )?
+                } else {
+                    ZstdBackend::default_level()
+                        .decompress(&compressed_data, toc_entry.original_size as usize)?
+                }
             }
             BackendTag::Lz4 => {
                 Lz4Backend.decompress(&compressed_data, toc_entry.original_size as usize)?

@@ -17,6 +17,9 @@ pub mod flags {
     /// The archive is just: header (88 bytes) + compressed data.
     /// TOC/file map offsets are unused (set to 0). chunk_count = 0.
     pub const SINGLE_STREAM: u32 = 1 << 4;
+    /// A shared zstd dictionary is stored after the header, before chunk data.
+    /// Format: [dict_size: u32][dict_data: [u8; dict_size]]
+    pub const HAS_DICTIONARY: u32 = 1 << 5;
 }
 
 /// Archive file header (88 bytes on disk).

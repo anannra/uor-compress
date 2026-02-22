@@ -44,6 +44,14 @@ impl CompressStats {
     }
 }
 
+/// Minimum fraction of duplicate bytes required to justify the chunked path.
+/// Below this threshold, single-stream compression wins because full-file
+/// dictionary context outweighs the dedup savings.
+const DEDUP_THRESHOLD: f64 = 0.10;
+
+/// Maximum dictionary size in bytes (64 KiB).
+const MAX_DICT_SIZE: usize = 64 * 1024;
+
 /// Compress a file using the UOR pipeline.
 pub fn compress_file(input: &Path, output: &Path, config: &CompressConfig) -> Result<CompressStats> {
     let input_data = fs::read(input)?;
@@ -57,18 +65,30 @@ pub fn compress_file(input: &Path, output: &Path, config: &CompressConfig) -> Re
     let chunker = Chunker::new(config.chunk_params.clone());
     let chunks = chunker.chunk(&input_data);
 
-    // Check for deduplication opportunity: do any chunks repeat?
+    // Measure dedup: count unique vs duplicate bytes.
     let mut seen = std::collections::HashSet::new();
-    let has_duplicates = chunks.iter().any(|c| !seen.insert(c.id));
+    let mut duplicate_bytes: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    for c in &chunks {
+        total_bytes += c.data.len() as u64;
+        if !seen.insert(c.id) {
+            duplicate_bytes += c.data.len() as u64;
+        }
+    }
+    let dedup_fraction = if total_bytes > 0 {
+        duplicate_bytes as f64 / total_bytes as f64
+    } else {
+        0.0
+    };
 
-    // Single-stream fast path: when there are no duplicate chunks, compress the
-    // entire file as one zstd stream. This eliminates per-chunk overhead and gives
-    // the compressor the full file as dictionary context — matching gzip behavior.
-    if !has_duplicates && matches!(config.mode, CompressionMode::Lossless) {
+    // Single-stream fast path: when dedup savings are too small to justify
+    // per-chunk overhead and context loss, compress the entire file as one
+    // zstd stream. This gives the compressor full dictionary context.
+    if dedup_fraction < DEDUP_THRESHOLD && matches!(config.mode, CompressionMode::Lossless) {
         return compress_single_stream(&input_data, output, checksum, config);
     }
 
-    // Multi-chunk path with dedup/delta support.
+    // Multi-chunk path with dedup/delta support and shared dictionary.
     compress_chunked(&input_data, &chunks, output, checksum, config)
 }
 
@@ -153,7 +173,27 @@ fn compress_single_stream(
     })
 }
 
-/// Multi-chunk compression with dedup and delta support.
+/// Build a shared dictionary by sampling evenly from the input data.
+fn build_dictionary(data: &[u8]) -> Vec<u8> {
+    let dict_size = data.len().min(MAX_DICT_SIZE);
+    if data.len() <= MAX_DICT_SIZE {
+        return data.to_vec();
+    }
+    // Sample 16 evenly-spaced segments to cover all content types.
+    let num_segments = 16usize;
+    let seg_size = dict_size / num_segments;
+    let stride = data.len() / num_segments;
+    let mut dict = Vec::with_capacity(dict_size);
+    for i in 0..num_segments {
+        let start = i * stride;
+        let end = (start + seg_size).min(data.len());
+        dict.extend_from_slice(&data[start..end]);
+    }
+    dict.truncate(dict_size);
+    dict
+}
+
+/// Multi-chunk compression with dedup, delta, and shared dictionary support.
 fn compress_chunked(
     input_data: &[u8],
     chunks: &[crate::chunk::cdc::Chunk],
@@ -162,6 +202,9 @@ fn compress_chunked(
     config: &CompressConfig,
 ) -> Result<CompressStats> {
     let original_size = input_data.len() as u64;
+
+    // Build a shared dictionary for cross-chunk context.
+    let dictionary = build_dictionary(input_data);
 
     let mut store = ChunkStore::new();
     let mut delta_detector = DeltaDetector::new();
@@ -232,7 +275,7 @@ fn compress_chunked(
                         base_chunk_id: Some(*base),
                     }
                 } else {
-                    compress_with_standard_backend(&chunk.data, chunk.id, config)?
+                    compress_with_standard_backend(&chunk.data, chunk.id, config, &dictionary)?
                 }
             }
             _ => {
@@ -253,10 +296,10 @@ fn compress_chunked(
                             base_chunk_id: None,
                         }
                     } else {
-                        compress_with_standard_backend(&chunk.data, chunk.id, config)?
+                        compress_with_standard_backend(&chunk.data, chunk.id, config, &dictionary)?
                     }
                 } else {
-                    compress_with_standard_backend(&chunk.data, chunk.id, config)?
+                    compress_with_standard_backend(&chunk.data, chunk.id, config, &dictionary)?
                 }
             }
         };
@@ -286,6 +329,9 @@ fn compress_chunked(
     let file = fs::File::create(output)?;
     let writer = BufWriter::new(file);
     let mut archive = ArchiveWriter::new(writer, original_size, checksum, archive_flags)?;
+
+    // Write the shared dictionary before chunk data.
+    archive.write_dictionary(&dictionary)?;
 
     for (_, cc) in &compressed_chunks {
         let toc = TocEntry {
@@ -343,10 +389,12 @@ fn compress_chunked(
 }
 
 /// Compress a chunk using the standard (non-delta, non-lossy) backend routing.
+/// When a shared dictionary is provided, zstd backends use it for cross-chunk context.
 fn compress_with_standard_backend(
     data: &[u8],
     id: ChunkId,
     config: &CompressConfig,
+    dict: &[u8],
 ) -> Result<CompressedChunk> {
     let profile = ChunkProfile::analyze(id, data);
 
@@ -363,7 +411,7 @@ fn compress_with_standard_backend(
         }
         (ChunkClass::Sparse, _) => {
             let zstd = ZstdBackend::high();
-            (zstd.compress(data)?, BackendTag::Zstd)
+            (zstd.compress_with_dict(data, dict)?, BackendTag::Zstd)
         }
         (_, CompressionLevel::Fast) => {
             let lz4 = Lz4Backend;
@@ -371,11 +419,11 @@ fn compress_with_standard_backend(
         }
         (_, CompressionLevel::Best) => {
             let zstd = ZstdBackend::high();
-            (zstd.compress(data)?, BackendTag::Zstd)
+            (zstd.compress_with_dict(data, dict)?, BackendTag::Zstd)
         }
         _ => {
             let zstd = ZstdBackend::default_level();
-            (zstd.compress(data)?, BackendTag::Zstd)
+            (zstd.compress_with_dict(data, dict)?, BackendTag::Zstd)
         }
     };
 
